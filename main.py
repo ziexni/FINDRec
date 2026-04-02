@@ -1,36 +1,68 @@
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-import numpy as np
+import sys
 import torch
-from torch.utils.data import DataLoader
+import numpy as np
 import pandas as pd
+from torch.utils.data import DataLoader
 
-from vlgraph_data_utils import MicroVideoVLDataset
-from vlgraph_model import VLGraph
+from vlgraph_data_utils import data_partition, build_item_modality, Data
+from model import VLGraph, train_and_test  # 원본 model.py 그대로 사용
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 평가 함수
-# ──────────────────────────────────────────────────────────────────────────────
-def evaluate(model, dataset, mode='valid', num_neg=100, topk=10,
-             batch_size=64, device='cuda'):
+def build_data_from_sequences(user_seqs, user_valid_or_test,
+                               item_to_image, item_to_title,
+                               mode='train'):
+    """
+    user_train / user_valid / user_test 딕셔너리로부터
+    원본 Data 클래스 입력 형식 (inputs, image_inputs, text_inputs, targets) 구성
+
+    mode='train': input=train[:-1], target=train[-1]
+    mode='valid': input=train,      target=valid[0]
+    mode='test' : input=train+valid,target=test[0]   ← 베이스라인 프로토콜
+    """
+    inputs       = []
+    image_inputs = []
+    text_inputs  = []
+    targets      = []
+
+    for u, seq in user_seqs.items():
+        gt = user_valid_or_test.get(u, [])
+        if not gt:
+            continue
+
+        if mode == 'train':
+            if len(seq) < 2:
+                continue
+            input_seq = seq[:-1]
+            target    = seq[-1]
+        else:
+            input_seq = seq  # valid: train / test: train+valid (호출 시 이미 합쳐서 전달)
+            target    = gt[0]
+
+        # 아이템 시퀀스 → image/title 노드 리스트 변환
+        img_seq = [item_to_image.get(item, [0]) for item in input_seq]
+        txt_seq = [item_to_title.get(item, [0]) for item in input_seq]
+
+        inputs.append(list(input_seq))
+        image_inputs.append(img_seq)
+        text_inputs.append(txt_seq)
+        targets.append(target)
+
+    return inputs, image_inputs, text_inputs, targets
+
+
+def evaluate(model, dataset, eval_dict, train_item_dict, itemnum,
+             mode='valid', num_neg=100, topk=10, batch_size=64):
     """
     101개 후보 기반 평가 (정답 1 + negative 100)
     베이스라인 프로토콜:
     - valid: 유저 수 > 1000  → 1000명 랜덤 샘플링
     - test : 유저 수 > 10000 → 10000명 랜덤 샘플링
-    - test 컨텍스트: train + valid 시퀀스
     """
-    model.eval()
+    import copy
 
-    eval_dict = dataset.user_valid if mode == 'valid' else dataset.user_test
+    all_valid_users = [u for u, items in eval_dict.items() if len(items) > 0]
 
-    # 평가 가능한 유저 필터링
-    all_valid_users = [u for u, items in eval_dict.items()
-                       if len(items) > 0 and len(dataset.user_train[u]) >= 1]
-
-    # 베이스라인과 동일한 유저 샘플링
     sample_limit = 1000 if mode == 'valid' else 10000
     if len(all_valid_users) > sample_limit:
         rng = np.random.RandomState(42)
@@ -38,58 +70,63 @@ def evaluate(model, dataset, mode='valid', num_neg=100, topk=10,
     else:
         valid_users = all_valid_users
 
-    # 평가용 Dataset (모드별 시퀀스 구성)
-    eval_dataset = MicroVideoVLDataset(
-        dataset.interactions_df,
-        dataset.image_feat[1:],  # 0-based로 다시 변환 (Dataset 내부에서 +1)
-        dataset.title_feat[1:],
-        max_seq_len=dataset.max_seq_len,
-        mode=mode
-    )
-    # valid_users만 필터링
-    valid_user_set = set(valid_users)
-    eval_dataset.samples = [(u, seq, t) for u, seq, t in eval_dataset.samples
-                            if u in valid_user_set]
-
-    eval_loader = DataLoader(eval_dataset, batch_size=batch_size,
-                             shuffle=False, num_workers=2)
-
-    # 유저별 표현 수집
-    user_reprs = {}
-    for batch in eval_loader:
-        user_ids  = batch['user_id'].tolist()
-        user_repr = model.get_user_repr(batch)  # (B, dim)
-        for i, u in enumerate(user_ids):
-            user_reprs[u] = user_repr[i]
-
-    # 아이템 임베딩 (1-based)
-    item_emb = model.embedding.weight[1:dataset.num_items].to(device)  # (num_items-1, dim)
-
     NDCG = HR = MRR = 0.0
     count = 0
     np.random.seed(42)
 
-    for u in valid_users:
-        if u not in user_reprs:
-            continue
-        u_repr = user_reprs[u]  # (dim,)
+    eval_loader = DataLoader(dataset, batch_size=batch_size,
+                             shuffle=False, num_workers=2)
 
-        target = eval_dict[u][0]['item_id']            # 1-based
-        rated  = dataset.train_item_dict[u] | {target}
+    # 유저별 예측 점수 수집
+    # dataset의 순서가 valid_users와 같아야 하므로
+    # dataset은 valid_users 순서로 구성되어 있다고 가정
+    model.eval()
+    all_scores = []
+    all_targets = []
 
-        # 후보 구성 (정답 1 + negative 100)
-        cands = [target - 1]  # 0-based for item_emb
+    for data in eval_loader:
+        adj, nodes, node_type_mask, node_pos_matrix, inputs_mask, targets, \
+            u_input, alias_inputs, alias_img_inputs, alias_txt_inputs = data
+
+        adj             = adj.float().cuda()
+        node_pos_matrix = node_pos_matrix.float().cuda()
+        nodes           = nodes.long().cuda()
+        node_type_mask  = node_type_mask.long().cuda()
+        alias_inputs    = alias_inputs.long().cuda()
+        alias_img_inputs = alias_img_inputs.long().cuda()
+        alias_txt_inputs = alias_txt_inputs.long().cuda()
+        inputs_mask     = inputs_mask.long().cuda()
+        targets         = targets.long().cuda()
+
+        with torch.no_grad():
+            node_hidden = model.forward(adj, nodes, node_type_mask,
+                                        node_pos_matrix, stage='test')
+            scores = model.compute_full_scores(node_hidden, alias_inputs,
+                                               alias_img_inputs, alias_txt_inputs,
+                                               inputs_mask)
+        all_scores.append(scores.cpu())
+        all_targets.append(targets.cpu())
+
+    all_scores  = torch.cat(all_scores,  dim=0)  # (N, itemnum)
+    all_targets = torch.cat(all_targets, dim=0)  # (N,)
+
+    for idx, u in enumerate(valid_users):
+        if idx >= len(all_scores):
+            break
+        target = all_targets[idx].item() - 1   # 0-based for scores
+        rated  = train_item_dict.get(u, set())
+
+        # 101개 후보 구성 (정답 1 + negative 100)
+        cands = [target]
         for _ in range(num_neg):
-            neg = np.random.randint(1, dataset.num_items)
-            while neg in rated:
-                neg = np.random.randint(1, dataset.num_items)
-            cands.append(neg - 1)
+            neg = np.random.randint(0, itemnum)
+            while (neg + 1) in rated or neg == target:
+                neg = np.random.randint(0, itemnum)
+            cands.append(neg)
 
-        cands_tensor = torch.tensor(cands, dtype=torch.long, device=device)
-        cand_emb     = item_emb[cands_tensor]           # (101, dim)
-        scores       = torch.matmul(cand_emb, u_repr)   # (101,)
+        cand_scores = all_scores[idx][cands]
+        rank = (-cand_scores).argsort().argsort()[0].item()
 
-        rank = (-scores).argsort().argsort()[0].item()
         count += 1
         MRR   += 1 / (rank + 1)
         if rank < topk:
@@ -100,37 +137,91 @@ def evaluate(model, dataset, mode='valid', num_neg=100, topk=10,
     return NDCG / N, HR / N, MRR / N
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 학습 루프
-# ──────────────────────────────────────────────────────────────────────────────
 def train(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
     # ── 데이터 로드 ───────────────────────────────────────────────────────
     print("Loading data...")
-    interactions_df = pd.read_parquet(config['interaction_path'])
-    item_df         = pd.read_parquet(config['item_path'])
-    title_feat      = np.load(config['title_npy_path'])
-    image_feat      = np.stack(item_df['video_feature'].values)
+    user_train, user_valid, user_test, usernum, itemnum = \
+        data_partition(config['interaction_path'])
 
-    config['num_items'] = interactions_df['item_id'].nunique() + 1  # 1-based max
+    item_df    = pd.read_parquet(config['item_path'])
+    title_feat = np.load(config['title_npy_path'])
+    image_feat = np.stack(item_df['video_feature'].values)
 
-    # ── Dataset / DataLoader ──────────────────────────────────────────────
-    train_dataset = MicroVideoVLDataset(
-        interactions_df, image_feat, title_feat,
-        max_seq_len=config['max_seq_len'], mode='train'
-    )
-    # interactions_df 참조 보관 (evaluate에서 재사용)
-    train_dataset.interactions_df = interactions_df
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=config['batch_size'],
-        shuffle=True, num_workers=config['num_workers']
+    # 아이템 → image/title 노드 ID 매핑
+    item_to_image, item_to_title = build_item_modality(
+        config['item_path'], title_feat, itemnum
     )
 
-    # ── 모델 초기화 ───────────────────────────────────────────────────────
-    model = VLGraph(config, train_dataset.image_feat, train_dataset.title_feat).to(device)
+    # train_item_dict: 유저별 학습 아이템 집합 (negative 샘플링용)
+    train_item_dict = {u: set(seq) for u, seq in user_train.items()}
+
+    # ── 학습 데이터 구성 ──────────────────────────────────────────────────
+    train_inputs, train_img, train_txt, train_targets = build_data_from_sequences(
+        user_train, user_train, item_to_image, item_to_title, mode='train'
+    )
+    train_data = Data(
+        (train_inputs, train_img, train_txt, train_targets),
+        item_to_image, item_to_title, link_k=config['link_k']
+    )
+
+    # ── valid 데이터 구성 (컨텍스트: train) ──────────────────────────────
+    valid_inputs, valid_img, valid_txt, valid_targets = build_data_from_sequences(
+        user_train, user_valid, item_to_image, item_to_title, mode='valid'
+    )
+    valid_data = Data(
+        (valid_inputs, valid_img, valid_txt, valid_targets),
+        item_to_image, item_to_title,
+        link_k=config['link_k'], train_len=train_data.max_len
+    )
+
+    # ── test 데이터 구성 (컨텍스트: train + valid) ────────────────────────
+    # 베이스라인 프로토콜: test 시 valid 아이템까지 컨텍스트에 포함
+    user_train_plus_valid = {}
+    for u in user_train:
+        extra = [user_valid[u][0]] if user_valid.get(u) else []
+        user_train_plus_valid[u] = user_train[u] + extra
+
+    test_inputs, test_img, test_txt, test_targets = build_data_from_sequences(
+        user_train_plus_valid, user_test, item_to_image, item_to_title, mode='valid'
+    )
+    test_data = Data(
+        (test_inputs, test_img, test_txt, test_targets),
+        item_to_image, item_to_title,
+        link_k=config['link_k'], train_len=train_data.max_len
+    )
+
+    # ── image/title 클러스터 피처 (원본 VLGraph 형식에 맞게) ─────────────
+    # 원본은 image_cluster_feature, text_cluster_feature를 받음
+    # 우리는 아이템별 피처를 그대로 사용 (클러스터링 없이)
+    # node ID offset에 맞게 인덱스 재구성
+    # image 노드 ID = itemnum + item_id (1-based)
+    # → image_cluster_feature[img_node_id - itemnum - 1] = image_feat[item_id - 1]
+    image_cluster_feature = image_feat  # (num_items, img_dim)
+    text_cluster_feature  = title_feat  # (num_items, title_dim)
+
+    # item_image_list / item_text_list: [num_items, K] 형태 (원본 형식)
+    # K=1이므로 각 아이템의 image/title 노드 ID 1개씩
+    num_items_raw = len(item_df)
+    item_image_list = [[itemnum + i + 1] for i in range(num_items_raw)]  # 1-based
+    item_text_list  = [[itemnum * 2 + i + 1] for i in range(num_items_raw)]
+
+    config['num_node'] = {config['dataset']: itemnum * 3 + 1}  # 원본 형식
+    config['cluster_num'] = {config['dataset']: num_items_raw}
+
+    # ── 모델 초기화 (원본 VLGraph 그대로) ────────────────────────────────
+    model = VLGraph(config, image_cluster_feature, text_cluster_feature,
+                    item_image_list, item_text_list).cuda()
+
+    train_loader = DataLoader(train_data, batch_size=config['batch_size'],
+                              shuffle=True, num_workers=config['num_workers'],
+                              pin_memory=True)
+    valid_loader = DataLoader(valid_data, batch_size=config['eval_batch_size'],
+                              shuffle=False, num_workers=2, pin_memory=True)
+    test_loader  = DataLoader(test_data,  batch_size=config['eval_batch_size'],
+                              shuffle=False, num_workers=2, pin_memory=True)
 
     best_val_ndcg  = 0.0
     best_test_ndcg = 0.0
@@ -139,42 +230,56 @@ def train(config):
     num_decreases  = 0
 
     for epoch in range(config['num_epochs']):
+        # ── 학습 (원본 train_and_test의 train 부분) ───────────────────────
         model.train()
         total_loss = 0.0
-
-        for batch in train_loader:
+        for data in train_loader:
             model.optimizer.zero_grad()
-            loss = model.compute_loss(batch)
+            adj, nodes, node_type_mask, node_pos_matrix, inputs_mask, targets, \
+                u_input, alias_inputs, alias_img_inputs, alias_txt_inputs = data
+
+            adj             = adj.float().cuda()
+            node_pos_matrix = node_pos_matrix.float().cuda()
+            nodes, node_type_mask = nodes.long().cuda(), node_type_mask.long().cuda()
+            alias_inputs    = alias_inputs.long().cuda()
+            alias_img_inputs = alias_img_inputs.long().cuda()
+            alias_txt_inputs = alias_txt_inputs.long().cuda()
+            inputs_mask     = inputs_mask.long().cuda()
+            targets         = targets.long().cuda()
+
+            node_hidden = model.forward(adj, nodes, node_type_mask,
+                                        node_pos_matrix, stage='train')
+            scores = model.compute_full_scores(node_hidden, alias_inputs,
+                                              alias_img_inputs, alias_txt_inputs,
+                                              inputs_mask)
+            loss = model.loss_function(scores, targets - 1)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             model.optimizer.step()
             total_loss += loss.item()
 
         model.scheduler.step()
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{config['num_epochs']} | Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{config['num_epochs']} | Loss: {total_loss/len(train_loader):.4f}")
 
-        # 주기적 평가
+        # ── 주기적 평가 ───────────────────────────────────────────────────
         if (epoch + 1) % config['eval_every'] == 0:
             val_ndcg, val_hr, val_mrr = evaluate(
-                model, train_dataset, mode='valid',
-                num_neg=config['num_neg'], topk=config['topk'],
-                batch_size=config['eval_batch_size'], device=device
+                model, valid_data, user_valid, train_item_dict, itemnum,
+                mode='valid', num_neg=config['num_neg'], topk=config['topk'],
+                batch_size=config['eval_batch_size']
             )
             print(f"  [Valid] NDCG@{config['topk']}: {val_ndcg:.4f} | "
                   f"HR@{config['topk']}: {val_hr:.4f} | "
                   f"MRR@{config['topk']}: {val_mrr:.4f}")
 
             test_ndcg, test_hr, test_mrr = evaluate(
-                model, train_dataset, mode='test',
-                num_neg=config['num_neg'], topk=config['topk'],
-                batch_size=config['eval_batch_size'], device=device
+                model, test_data, user_test, train_item_dict, itemnum,
+                mode='test', num_neg=config['num_neg'], topk=config['topk'],
+                batch_size=config['eval_batch_size']
             )
             print(f"  [Test]  NDCG@{config['topk']}: {test_ndcg:.4f} | "
                   f"HR@{config['topk']}: {test_hr:.4f} | "
                   f"MRR@{config['topk']}: {test_mrr:.4f}")
 
-            # Best 모델 저장 & Early Stopping
             if val_ndcg > best_val_ndcg:
                 best_val_ndcg  = val_ndcg
                 best_test_ndcg = test_ndcg
@@ -204,34 +309,35 @@ if __name__ == '__main__':
         'item_path':        './item_used.parquet',
         'title_npy_path':   './title_emb.npy',
         'save_path':        './vlgraph_best.pt',
+        'dataset':          'microvideo',
 
-        # 모델 구조
-        'embedding_size': 128,      # 임베딩 차원
-        'n_layer':          2,      # GNN 레이어 수
-        'aggregator':   'rgat',     # rgat / hete_attention / kv_attention / gcn / graphsage / gat
-        'max_relid':       10,      # 엣지 타입 수 (1~10)
-        'alpha':          0.2,      # LeakyReLU negative slope
-        'max_seq_len':     50,      # 최대 시퀀스 길이
-        'fusion_type':   'gate',    # HeteAttenLayer용 (aggregator=hete_attention일 때)
+        # 원본 VLGraph 하이퍼파라미터
+        'embedding_size':  128,
+        'n_layer':           2,
+        'aggregator':    'rgat',
+        'max_relid':        10,
+        'alpha':           0.2,
+        'link_k':            1,   # 아이템당 image/title 노드 수 (K=1)
+        'fusion_type':   'gate',
+        'dropout_local':   0.2,
+        'dropout_atten':   0.2,
+        'seq_pooling':  'attention',
+        'modality_prediction': True,
+        'auxiliary_info': ['node_type', 'pos'],
 
         # 학습 설정
-        'lr':            1e-3,      # 학습률
-        'l2':            1e-5,      # L2 정규화
-        'lr_dc':          0.1,      # LR decay 비율
-        'lr_dc_step':      3,       # LR decay 주기 (에폭)
-        'batch_size':     128,      # 학습 배치 크기
-        'num_workers':      3,      # DataLoader 워커 수
-        'num_epochs':     100,      # 최대 학습 에폭
-        'eval_every':       5,      # 평가 주기
-        'topk':            10,      # 평가 지표 K
-        'patience':         3,      # Early stopping patience
-        'num_neg':        100,      # negative 샘플 수
-        'eval_batch_size':  64,     # 평가 배치 크기
-        'dropout_local':   0.2,     # GNN dropout
-        'dropout_atten':   0.2,     # Attention dropout
-
-        # auxiliary info (node_type / pos 임베딩 사용 여부)
-        'auxiliary_info': ['node_type', 'pos'],
+        'lr':             1e-3,
+        'l2':             1e-5,
+        'lr_dc':           0.1,
+        'lr_dc_step':        3,
+        'batch_size':      128,
+        'num_workers':       3,
+        'num_epochs':      100,
+        'eval_every':        5,
+        'topk':             10,
+        'patience':          3,
+        'num_neg':         100,
+        'eval_batch_size':  64,
     }
 
     train(config)
