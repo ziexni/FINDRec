@@ -316,10 +316,10 @@ class MultiViewEntropyBottleneck(nn.Module):
             'total_loss': total_loss
         }
 
-class Fliud_MMRec(SequentialRecommender):
+class Fluid_MMRec(SequentialRecommender):
     def __init__(self, config, dataset, image_feat, text_feat):
         # ── 변경: image_feat, text_feat 인자로 직접 받음 ──────────────────
-        super(Fliud_MMRec, self).__init__(config, dataset)
+        super(Fluid_MMRec, self).__init__(config, dataset)
         
         self.dataset = dataset
         self.config = config
