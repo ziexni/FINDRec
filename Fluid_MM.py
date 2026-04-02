@@ -1,15 +1,13 @@
 import os
 import random
-import math
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from collections import defaultdict
 from tqdm import tqdm
 
-from fluid_mmrec import FluidMMRec
+from fluid_mmrec import MultiModalMoERec
 
 
 def set_seed(seed=42):
@@ -40,7 +38,7 @@ class FluidDataset(Dataset):
 
     def __getitem__(self, idx):
         u, seq, target = self.samples[idx]
-        seq = seq[-self.max_seq_len:]
+        seq     = seq[-self.max_seq_len:]
         seq_len = len(seq)
         pad_len = self.max_seq_len - seq_len
         item_ids = seq + [0] * pad_len
@@ -55,33 +53,29 @@ class FluidDataset(Dataset):
 def load_data(interaction_path, item_path, title_npy_path, max_seq_len=50):
     """
     우리 데이터 로딩 + leave-two-out 분할
-    return:
-        train_samples, valid_samples, test_samples
-        num_items, image_features, text_features
-        train_item_dict
+    - item_id: 1-based (0=padding)
+    - train: 마지막 2개 제외 → 학습 샘플: input=train[:-1], target=train[-1]
+    - valid: 뒤에서 2번째   → 평가 샘플: input=train, target=valid
+    - test:  마지막          → 평가 샘플: input=train+valid, target=test
     """
     interactions_df = pd.read_parquet(interaction_path).sort_values(['user_id', 'timestamp'])
     item_df         = pd.read_parquet(item_path).reset_index(drop=True)
-    title_feat      = np.load(title_npy_path)  # (num_items, D_txt)
+    title_feat      = np.load(title_npy_path)
 
-    # 1-based item_id
     interactions_df = interactions_df.copy()
-    interactions_df['item_id'] = interactions_df['item_id'] + 1
+    interactions_df['item_id'] = interactions_df['item_id'] + 1  # 1-based
     num_items = int(interactions_df['item_id'].max())
 
-    # 아이템 피처: 0-based index
     image_features = np.stack(item_df['video_feature'].values)  # (num_items, D_img)
     text_features  = title_feat                                  # (num_items, D_txt)
 
-    # 유저 시퀀스 구성
     user_sequences = defaultdict(list)
     for _, row in interactions_df.iterrows():
         user_sequences[int(row['user_id'])].append(int(row['item_id']))
 
-    # leave-two-out 분할
-    train_samples = []
-    valid_samples = []
-    test_samples  = []
+    train_samples   = []
+    valid_samples   = []
+    test_samples    = []
     train_item_dict = defaultdict(set)
 
     for u, seq in user_sequences.items():
@@ -94,14 +88,14 @@ def load_data(interaction_path, item_path, title_npy_path, max_seq_len=50):
         for s in train_seq:
             train_item_dict[u].add(s)
 
-        # train 샘플: input=train_seq[:-1], target=train_seq[-1]
+        # train 샘플
         if len(train_seq) >= 2:
             train_samples.append((u, train_seq[:-1], train_seq[-1]))
 
         # valid 샘플: input=train_seq, target=valid_item
         valid_samples.append((u, train_seq, valid_item))
 
-        # test 샘플: input=train_seq + valid_item, target=test_item
+        # test 샘플: input=train_seq+valid_item, target=test_item
         test_samples.append((u, train_seq + [valid_item], test_item))
 
     return (train_samples, valid_samples, test_samples,
@@ -130,7 +124,6 @@ def evaluate(model, data_loader, train_item_dict, num_items,
         user_ids = batch['user_id'].tolist()
         B        = item_ids.size(0)
 
-        # 101개 후보 구성
         candidates = []
         for b in range(B):
             target = targets[b].item()
@@ -143,10 +136,10 @@ def evaluate(model, data_loader, train_item_dict, num_items,
                 cands.append(neg)
             candidates.append(cands)
 
-        candidates = torch.tensor(candidates, dtype=torch.long, device=device)  # (B, 101)
+        candidates = torch.tensor(candidates, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            scores = model.predict_candidates(item_ids, seq_len, candidates)  # (B, 101)
+            scores = model.predict_candidates(item_ids, seq_len, candidates)
 
         ranks = (-scores).argsort(dim=1).argsort(dim=1)[:, 0]
         for rank in ranks.cpu().tolist():
@@ -193,7 +186,7 @@ def train(config):
     test_loader  = DataLoader(test_dataset,  batch_size=config['batch_size'],
                               shuffle=False, num_workers=config['num_workers'])
 
-    model = FluidMMRec(config, num_items, image_features, text_features).to(device)
+    model = MultiModalMoERec(config, num_items, image_features, text_features).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(),
                                    lr=config['learning_rate'],
@@ -229,7 +222,7 @@ def train(config):
         print(f"Epoch {epoch+1}/{config['epochs']} | Loss: {avg_loss:.4f}")
 
         if (epoch + 1) % config['eval_step'] == 0:
-            # valid: train 시퀀스 기준 (valid 아이템 예측)
+            # valid: train 시퀀스 기준
             val_ndcg, val_hr, val_mrr = evaluate(
                 model, valid_loader, train_item_dict, num_items,
                 topk=config['topk'], num_neg=config['num_neg'], device=device
@@ -237,7 +230,7 @@ def train(config):
             print(f"  [Valid] NDCG@{config['topk']}: {val_ndcg:.4f} | "
                   f"HR@{config['topk']}: {val_hr:.4f} | MRR: {val_mrr:.4f}")
 
-            # test: train + valid 시퀀스 기준 (test 아이템 예측)
+            # test: train+valid 시퀀스 기준
             test_ndcg, test_hr, test_mrr = evaluate(
                 model, test_loader, train_item_dict, num_items,
                 topk=config['topk'], num_neg=config['num_neg'], device=device
@@ -264,74 +257,3 @@ def train(config):
     print(f"Best Test  NDCG@{config['topk']}: {best_test_ndcg:.4f} | "
           f"HR@{config['topk']}: {best_test_hr:.4f} | MRR: {best_test_mrr:.4f}")
     print(f"{'='*50}")
-
-
-if __name__ == '__main__':
-    config = {
-        # ── 데이터 경로 ───────────────────────────────────────────────────
-        'interaction_path': './interaction.parquet',
-        'item_path':        './item_used.parquet',
-        'title_npy_path':   './title_emb.npy',
-        'save_path':        './best_fluid.pt',
-
-        # ── 모델 구조 (원본 yaml과 동일) ──────────────────────────────────
-        'id_embedding_dim':     128,
-        'num_attention_heads':    8,
-        'dropout_prob':         0.2,
-        'bottleneck': {
-            'dim':               256,
-            'beta':              1.0,
-            'weight':            0.1,
-            'kernel_type':      'rbf',
-            'bandwidth_factor':  1.0,
-            'adaptive_bandwidth': True,
-            'min_bandwidth':     0.1,
-            'max_bandwidth':    10.0,
-        },
-        'mamba': {
-            'd_state':    16,
-            'd_conv':      4,
-            'expand':      2,
-            'norm_eps':  1e-5,
-            'hidden_dim': 128,
-            'num_layers':   2,
-        },
-        'multimodal': {
-            'hidden_size':          256,
-            'projection_dropout':   0.2,
-            'fusion_dropout':       0.2,
-        },
-        'expert': {
-            'num_experts': 4,
-        },
-        'router': {
-            'hidden_size': 256,
-            'dropout':     0.1,
-        },
-        'image': {
-            'feature_dim':    None,   # load_data에서 자동 설정
-            'projection_dim': 256,
-        },
-        'text': {
-            'feature_dim':    None,   # load_data에서 자동 설정
-            'projection_dim': 256,
-        },
-
-        # ── 학습 파라미터 ─────────────────────────────────────────────────
-        'seed':               42,
-        'epochs':            100,
-        'batch_size':        128,
-        'num_workers':         3,
-        'learning_rate':    0.001,
-        'weight_decay':      0.01,
-        'gradient_clip_norm': 2.0,
-        'eval_step':           1,
-        'stopping_step':       5,
-        'max_seq_len':        50,
-
-        # ── 평가 (베이스라인과 동일) ──────────────────────────────────────
-        'topk':   10,    # NDCG@10, HR@10, MRR
-        'num_neg': 100,  # 101개 후보 (정답 1 + negative 100)
-    }
-
-    train(config)
