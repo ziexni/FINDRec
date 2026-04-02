@@ -9,16 +9,6 @@ from tqdm import tqdm
 
 from fluid_mmrec import MultiModalMoERec
 
-
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 class FluidDataset(Dataset):
@@ -115,7 +105,6 @@ def evaluate(model, data_loader, train_item_dict, num_items,
     model.eval()
     NDCG = HR = MRR = 0.0
     count = 0
-    np.random.seed(42)
 
     for batch in data_loader:
         item_ids = batch['item_ids'].to(device)
@@ -156,7 +145,6 @@ def evaluate(model, data_loader, train_item_dict, num_items,
 # ── 학습 ─────────────────────────────────────────────────────────────────────
 
 def train(config):
-    set_seed(config['seed'])
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
