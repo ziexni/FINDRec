@@ -337,7 +337,7 @@ if __name__ == '__main__':
         'topk':             10,
         'patience':          3,
         'num_neg':         100,
-        'eval_batch_size':  64,
+        'eval_batch_size':  10,
     }
 
     train(config)
